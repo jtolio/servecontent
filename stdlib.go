@@ -5,6 +5,7 @@
 package servecontent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,16 @@ import (
 
 // The DetectContentType algorithm uses at most sniffLen bytes to make its decision.
 const sniffLen = 512
+
+// errSeeker is returned by ServeContent's sizeFunc when the content
+// doesn't seek properly. The underlying Seeker's error text isn't
+// included in the sizeFunc reply so it's not sent over HTTP to end
+// users.
+var errSeeker = errors.New("seeker can't seek")
+
+// errNoOverlap is returned by serveContent's parseRange if first-byte-pos of
+// all of the byte-range-spec values is greater than the content size.
+var errNoOverlap = errors.New("invalid range: failed to overlap")
 
 // ServeContent replies to the request using the content in the
 // provided ReadSeeker. The main benefit of ServeContent over io.Copy
@@ -46,36 +57,7 @@ const sniffLen = 512
 // ServeContent uses it to handle requests using If-Match, If-None-Match, or If-Range.
 //
 // Note that *os.File implements the io.ReadSeeker interface.
-func ServeContent(w http.ResponseWriter, req *http.Request, name string, modtime time.Time, content io.ReadSeeker) {
-	sizeFunc := func() (int64, error) {
-		size, err := content.Seek(0, io.SeekEnd)
-		if err != nil {
-			return 0, errSeeker
-		}
-		_, err = content.Seek(0, io.SeekStart)
-		if err != nil {
-			return 0, errSeeker
-		}
-		return size, nil
-	}
-	serveContent(w, req, name, modtime, sizeFunc, content)
-}
-
-// errSeeker is returned by ServeContent's sizeFunc when the content
-// doesn't seek properly. The underlying Seeker's error text isn't
-// included in the sizeFunc reply so it's not sent over HTTP to end
-// users.
-var errSeeker = errors.New("seeker can't seek")
-
-// errNoOverlap is returned by serveContent's parseRange if first-byte-pos of
-// all of the byte-range-spec values is greater than the content size.
-var errNoOverlap = errors.New("invalid range: failed to overlap")
-
-// if name is empty, filename is unknown. (used for mime type, before sniffing)
-// if modtime.IsZero(), modtime is unknown.
-// content must be seeked to the beginning of the file.
-// The sizeFunc is called at most once. Its error, if any, is sent in the HTTP response.
-func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime time.Time, sizeFunc func() (int64, error), content io.ReadSeeker) {
+func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content) {
 	setLastModified(w, modtime)
 	done, rangeReq := checkPreconditions(w, r, modtime)
 	if done {
