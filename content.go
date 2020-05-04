@@ -16,6 +16,9 @@ var (
 	ErrInvalidOffset = errors.New("invalid offset")
 )
 
+// The DetectContentType algorithm uses at most sniffLen bytes to make its decision.
+const sniffLen = 512
+
 // RangeFunc represents a way of getting a range of data from a stream.
 // If length == -1, the range from the offset to the end is requested. offset
 // and length are *not* guaranteed to be within the stream's size.
