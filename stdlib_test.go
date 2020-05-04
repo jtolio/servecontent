@@ -27,22 +27,6 @@ const (
 	testFileLen = 11
 )
 
-func ServeFile(w http.ResponseWriter, r *http.Request, name string) {
-	f, err := os.Open(name)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	defer f.Close()
-	d, err := f.Stat()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
-	ServeContent(w, r, name, d.ModTime(), f)
-}
-
 type wantRange struct {
 	start, end int64 // range [start,end)
 }
@@ -78,7 +62,7 @@ var ServeFileRangeTests = []struct {
 
 func TestServeFile(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, testFile)
+		serveFile(w, r, testFile)
 	}))
 	defer ts.Close()
 	c := ts.Client()
@@ -194,7 +178,7 @@ func TestServeFileContentType(t *testing.T) {
 			// Explicitly inhibit sniffing.
 			w.Header()["Content-Type"] = []string{}
 		}
-		ServeFile(w, r, "testdata/file")
+		serveFile(w, r, "testdata/file")
 	}))
 	defer ts.Close()
 	get := func(override string, want []string) {
@@ -214,7 +198,7 @@ func TestServeFileContentType(t *testing.T) {
 
 func TestServeFileMimeType(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ServeFile(w, r, "testdata/style.css")
+		serveFile(w, r, "testdata/style.css")
 	}))
 	defer ts.Close()
 	resp, err := http.Get(ts.URL)
@@ -230,7 +214,7 @@ func TestServeFileMimeType(t *testing.T) {
 
 func TestServeFileFromCWD(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ServeFile(w, r, "stdlib_test.go")
+		serveFile(w, r, "stdlib_test.go")
 	}))
 	defer ts.Close()
 	r, err := http.Get(ts.URL)
@@ -268,7 +252,7 @@ func TestServeContent(t *testing.T) {
 		if p.contentType != "" {
 			w.Header().Set("Content-Type", p.contentType)
 		}
-		ServeContent(w, r, p.name, p.modtime, p.content)
+		serveContent(w, r, p.name, p.modtime, p.content)
 	}))
 	defer ts.Close()
 
@@ -562,7 +546,7 @@ func getBody(t *testing.T, testName string, req http.Request, client *http.Clien
 
 type panicOnSeek struct{ io.ReadSeeker }
 
-func Test_scanETag(t *testing.T) {
+func Test_ScanETag(t *testing.T) {
 	tests := []struct {
 		in         string
 		wantETag   string
@@ -578,9 +562,9 @@ func Test_scanETag(t *testing.T) {
 		{`"spaced etag"`, "", ""},
 	}
 	for _, test := range tests {
-		etag, remain := scanETag(test.in)
+		etag, remain := ScanETag(test.in)
 		if etag != test.wantETag || remain != test.wantRemain {
-			t.Errorf("scanETag(%q)=%q %q, want %q %q", test.in, etag, remain, test.wantETag, test.wantRemain)
+			t.Errorf("ScanETag(%q)=%q %q, want %q %q", test.in, etag, remain, test.wantETag, test.wantRemain)
 		}
 	}
 }

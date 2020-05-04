@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -22,16 +23,18 @@ import (
 // The DetectContentType algorithm uses at most sniffLen bytes to make its decision.
 const sniffLen = 512
 
-// errSeeker is returned by ServeContent's sizeFunc when the content
-// doesn't seek properly. The underlying Seeker's error text isn't
-// included in the sizeFunc reply so it's not sent over HTTP to end
-// users.
-var errSeeker = errors.New("seeker can't seek")
-
-// errNoOverlap is returned by serveContent's parseRange if first-byte-pos of
+// ErrNoOverlap is returned by ParseRange if first-byte-pos of
 // all of the byte-range-spec values is greater than the content size.
-var errNoOverlap = errors.New("invalid range: failed to overlap")
+var ErrNoOverlap = errors.New("invalid range: failed to overlap")
 
+func min(x, y int64) int64 {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+// TODO: update documentation here
 // ServeContent replies to the request using the content in the
 // provided ReadSeeker. The main benefit of ServeContent over io.Copy
 // is that it handles Range requests properly, sets the MIME type, and
@@ -58,10 +61,24 @@ var errNoOverlap = errors.New("invalid range: failed to overlap")
 //
 // Note that *os.File implements the io.ReadSeeker interface.
 func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content) {
-	setLastModified(w, modtime)
-	done, rangeReq := checkPreconditions(w, r, modtime)
-	if done {
+	name := content.Name
+	sizeFunc := content.Size
+
+	// EvaluatePreconditions sets w.Header() Last-Modified and Etag fields for us.
+	if EvaluatePreconditions(w, r, content.ModTime, content.ETag) {
 		return
+	}
+
+	size, err := sizeFunc(ctx)
+	if err != nil {
+		// The underlying error text isn't included in the reply so it's not sent to end users.
+		http.Error(w, "failed getting size", http.StatusInternalServerError)
+		return
+	}
+
+	rangeReq := r.Header.Get("Range")
+	if rangeReq != "" && CheckIfRange(r, content.ETag, content.ModTime) == CondFalse {
+		rangeReq = ""
 	}
 
 	code := http.StatusOK
@@ -74,95 +91,101 @@ func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, c
 		ctype = mime.TypeByExtension(filepath.Ext(name))
 		if ctype == "" {
 			// read a chunk to decide between utf-8 text and binary
-			var buf [sniffLen]byte
-			n, _ := io.ReadFull(content, buf[:])
-			ctype = http.DetectContentType(buf[:n])
-			_, err := content.Seek(0, io.SeekStart) // rewind to output whole file
+			// TODO: don't force reading this twice
+			r, err := content.Range(ctx, 0, min(sniffLen, size))
 			if err != nil {
-				http.Error(w, "seeker can't seek", http.StatusInternalServerError)
+				http.Error(w, "failed getting range", http.StatusInternalServerError)
 				return
 			}
+			buf, err := ioutil.ReadAll(r)
+			r.Close()
+			if err != nil {
+				http.Error(w, "failed getting range", http.StatusInternalServerError)
+				return
+			}
+			ctype = http.DetectContentType(buf)
 		}
 		w.Header().Set("Content-Type", ctype)
 	} else if len(ctypes) > 0 {
 		ctype = ctypes[0]
 	}
 
-	size, err := sizeFunc()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	sendSize := size
+	sendContent := func() (io.ReadCloser, error) { return content.Range(ctx, 0, size) }
+
+	if size < 0 {
+		w.WriteHeader(code)
 		return
 	}
 
-	// handle Content-Range header.
-	sendSize := size
-	var sendContent io.Reader = content
-	if size >= 0 {
-		ranges, err := parseRange(rangeReq, size)
-		if err != nil {
-			if err == errNoOverlap {
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-			}
-			http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-			return
+	ranges, err := ParseRange(rangeReq, size)
+	if err != nil {
+		if err == ErrNoOverlap {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
 		}
-		if sumRangesSize(ranges) > size {
-			// The total number of bytes in all the ranges
-			// is larger than the size of the file by
-			// itself, so this is probably an attack, or a
-			// dumb client. Ignore the range request.
-			ranges = nil
+		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if SumRangesSize(ranges) > size {
+		// The total number of bytes in all the ranges
+		// is larger than the size of the file by
+		// itself, so this is probably an attack, or a
+		// dumb client. Ignore the range request.
+		ranges = nil
+	}
+	switch {
+	case len(ranges) == 1:
+		// RFC 7233, Section 4.1:
+		// "If a single part is being transferred, the server
+		// generating the 206 response MUST generate a
+		// Content-Range header field, describing what range
+		// of the selected representation is enclosed, and a
+		// payload consisting of the range.
+		// ...
+		// A server MUST NOT generate a multipart response to
+		// a request for a single range, since a client that
+		// does not request multiple parts might not support
+		// multipart responses."
+		ra := ranges[0]
+		sendContent = func() (io.ReadCloser, error) {
+			// TODO: should we return http.StatusRequestedRangeNotSatisfiable in certain
+			// Range error conditions?
+			return content.Range(ctx, ra.Start, ra.Length)
 		}
-		switch {
-		case len(ranges) == 1:
-			// RFC 7233, Section 4.1:
-			// "If a single part is being transferred, the server
-			// generating the 206 response MUST generate a
-			// Content-Range header field, describing what range
-			// of the selected representation is enclosed, and a
-			// payload consisting of the range.
-			// ...
-			// A server MUST NOT generate a multipart response to
-			// a request for a single range, since a client that
-			// does not request multiple parts might not support
-			// multipart responses."
-			ra := ranges[0]
-			if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-				http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-				return
-			}
-			sendSize = ra.length
-			code = http.StatusPartialContent
-			w.Header().Set("Content-Range", ra.contentRange(size))
-		case len(ranges) > 1:
-			sendSize = rangesMIMESize(ranges, ctype, size)
-			code = http.StatusPartialContent
+		sendSize = ra.Length
+		code = http.StatusPartialContent
+		w.Header().Set("Content-Range", ra.ContentRange(size))
+	case len(ranges) > 1:
+		sendSize = RangesMIMESize(ranges, ctype, size)
+		code = http.StatusPartialContent
 
-			pr, pw := io.Pipe()
-			mw := multipart.NewWriter(pw)
-			w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
-			sendContent = pr
-			defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
-			go func() {
-				for _, ra := range ranges {
-					part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
-					if err != nil {
-						pw.CloseWithError(err)
-						return
-					}
-					if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-						pw.CloseWithError(err)
-						return
-					}
-					if _, err := io.CopyN(part, content, ra.length); err != nil {
-						pw.CloseWithError(err)
-						return
-					}
+		pr, pw := io.Pipe()
+		mw := multipart.NewWriter(pw)
+		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+		sendContent = func() (io.ReadCloser, error) { return ioutil.NopCloser(pr), nil }
+		defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
+		go func() {
+			for _, ra := range ranges {
+				part, err := mw.CreatePart(ra.MIMEHeader(ctype, size))
+				if err != nil {
+					pw.CloseWithError(err)
+					return
 				}
-				mw.Close()
-				pw.Close()
-			}()
-		}
+				contentRange, err := content.Range(ctx, ra.Start, ra.Length)
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+				_, err = io.CopyN(part, contentRange, ra.Length)
+				contentRange.Close()
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+			}
+			mw.Close()
+			pw.Close()
+		}()
 
 		w.Header().Set("Accept-Ranges", "bytes")
 		if w.Header().Get("Content-Encoding") == "" {
@@ -173,14 +196,22 @@ func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, c
 	w.WriteHeader(code)
 
 	if r.Method != "HEAD" {
-		io.CopyN(w, sendContent, sendSize)
+		r, err := sendContent()
+		if err != nil {
+			// TODO: this maybe should be http.StatusRequestedRangeNotSatisfiable sometimes
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer r.Close()
+
+		io.CopyN(w, r, sendSize)
 	}
 }
 
-// scanETag determines if a syntactically valid ETag is present at s. If so,
+// ScanETag determines if a syntactically valid ETag is present at s. If so,
 // the ETag and remaining text after consuming ETag is returned. Otherwise,
 // it returns "", "".
-func scanETag(s string) (etag string, remain string) {
+func ScanETag(s string) (etag string, remain string) {
 	s = textproto.TrimString(s)
 	start := 0
 	if strings.HasPrefix(s, "W/") {
@@ -205,32 +236,32 @@ func scanETag(s string) (etag string, remain string) {
 	return "", ""
 }
 
-// etagStrongMatch reports whether a and b match using strong ETag comparison.
+// ETagStrongMatch reports whether a and b match using strong ETag comparison.
 // Assumes a and b are valid ETags.
-func etagStrongMatch(a, b string) bool {
+func ETagStrongMatch(a, b string) bool {
 	return a == b && a != "" && a[0] == '"'
 }
 
-// etagWeakMatch reports whether a and b match using weak ETag comparison.
+// ETagWeakMatch reports whether a and b match using weak ETag comparison.
 // Assumes a and b are valid ETags.
-func etagWeakMatch(a, b string) bool {
+func ETagWeakMatch(a, b string) bool {
 	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
 }
 
-// condResult is the result of an HTTP request precondition check.
+// CondResult is the result of an HTTP request precondition check.
 // See https://tools.ietf.org/html/rfc7232 section 3.
-type condResult int
+type CondResult int
 
 const (
-	condNone condResult = iota
-	condTrue
-	condFalse
+	CondNone CondResult = iota
+	CondTrue
+	CondFalse
 )
 
-func checkIfMatch(w http.ResponseWriter, r *http.Request) condResult {
-	im := r.Header.Get("If-Match")
+func CheckIfMatch(h http.Header, etag string) CondResult {
+	im := h.Get("If-Match")
 	if im == "" {
-		return condNone
+		return CondNone
 	}
 	for {
 		im = textproto.TrimString(im)
@@ -242,44 +273,44 @@ func checkIfMatch(w http.ResponseWriter, r *http.Request) condResult {
 			continue
 		}
 		if im[0] == '*' {
-			return condTrue
+			return CondTrue
 		}
-		etag, remain := scanETag(im)
-		if etag == "" {
+		et, remain := ScanETag(im)
+		if et == "" {
 			break
 		}
-		if etagStrongMatch(etag, w.Header().Get("Etag")) {
-			return condTrue
+		if ETagStrongMatch(et, etag) {
+			return CondTrue
 		}
 		im = remain
 	}
 
-	return condFalse
+	return CondFalse
 }
 
-func checkIfUnmodifiedSince(r *http.Request, modtime time.Time) condResult {
-	ius := r.Header.Get("If-Unmodified-Since")
+func CheckIfUnmodifiedSince(h http.Header, modtime time.Time) CondResult {
+	ius := h.Get("If-Unmodified-Since")
 	if ius == "" || isZeroTime(modtime) {
-		return condNone
+		return CondNone
 	}
 	t, err := http.ParseTime(ius)
 	if err != nil {
-		return condNone
+		return CondNone
 	}
 
 	// The Last-Modified header truncates sub-second precision so
 	// the modtime needs to be truncated too.
 	modtime = modtime.Truncate(time.Second)
 	if modtime.Before(t) || modtime.Equal(t) {
-		return condTrue
+		return CondTrue
 	}
-	return condFalse
+	return CondFalse
 }
 
-func checkIfNoneMatch(w http.ResponseWriter, r *http.Request) condResult {
-	inm := r.Header.Get("If-None-Match")
+func CheckIfNoneMatch(h http.Header, etag string) CondResult {
+	inm := h.Get("If-None-Match")
 	if inm == "" {
-		return condNone
+		return CondNone
 	}
 	buf := inm
 	for {
@@ -291,70 +322,70 @@ func checkIfNoneMatch(w http.ResponseWriter, r *http.Request) condResult {
 			buf = buf[1:]
 		}
 		if buf[0] == '*' {
-			return condFalse
+			return CondFalse
 		}
-		etag, remain := scanETag(buf)
-		if etag == "" {
+		et, remain := ScanETag(buf)
+		if et == "" {
 			break
 		}
-		if etagWeakMatch(etag, w.Header().Get("Etag")) {
-			return condFalse
+		if ETagWeakMatch(et, etag) {
+			return CondFalse
 		}
 		buf = remain
 	}
-	return condTrue
+	return CondTrue
 }
 
-func checkIfModifiedSince(r *http.Request, modtime time.Time) condResult {
+func CheckIfModifiedSince(r *http.Request, modtime time.Time) CondResult {
 	if r.Method != "GET" && r.Method != "HEAD" {
-		return condNone
+		return CondNone
 	}
 	ims := r.Header.Get("If-Modified-Since")
 	if ims == "" || isZeroTime(modtime) {
-		return condNone
+		return CondNone
 	}
 	t, err := http.ParseTime(ims)
 	if err != nil {
-		return condNone
+		return CondNone
 	}
 	// The Last-Modified header truncates sub-second precision so
 	// the modtime needs to be truncated too.
 	modtime = modtime.Truncate(time.Second)
 	if modtime.Before(t) || modtime.Equal(t) {
-		return condFalse
+		return CondFalse
 	}
-	return condTrue
+	return CondTrue
 }
 
-func checkIfRange(w http.ResponseWriter, r *http.Request, modtime time.Time) condResult {
+func CheckIfRange(r *http.Request, etag string, modtime time.Time) CondResult {
 	if r.Method != "GET" && r.Method != "HEAD" {
-		return condNone
+		return CondNone
 	}
 	ir := r.Header.Get("If-Range")
 	if ir == "" {
-		return condNone
+		return CondNone
 	}
-	etag, _ := scanETag(ir)
-	if etag != "" {
-		if etagStrongMatch(etag, w.Header().Get("Etag")) {
-			return condTrue
+	et, _ := ScanETag(ir)
+	if et != "" {
+		if ETagStrongMatch(et, etag) {
+			return CondTrue
 		} else {
-			return condFalse
+			return CondFalse
 		}
 	}
 	// The If-Range value is typically the ETag value, but it may also be
 	// the modtime date. See golang.org/issue/8367.
 	if modtime.IsZero() {
-		return condFalse
+		return CondFalse
 	}
 	t, err := http.ParseTime(ir)
 	if err != nil {
-		return condFalse
+		return CondFalse
 	}
 	if t.Unix() == modtime.Unix() {
-		return condTrue
+		return CondTrue
 	}
-	return condFalse
+	return CondFalse
 }
 
 var unixEpochTime = time.Unix(0, 0)
@@ -364,13 +395,7 @@ func isZeroTime(t time.Time) bool {
 	return t.IsZero() || t.Equal(unixEpochTime)
 }
 
-func setLastModified(w http.ResponseWriter, modtime time.Time) {
-	if !isZeroTime(modtime) {
-		w.Header().Set("Last-Modified", modtime.UTC().Format(http.TimeFormat))
-	}
-}
-
-func writeNotModified(w http.ResponseWriter) {
+func WriteNotModified(w http.ResponseWriter) {
 	// RFC 7232 section 4.1:
 	// a sender SHOULD NOT generate representation metadata other than the
 	// above listed fields unless said metadata exists for the purpose of
@@ -385,60 +410,62 @@ func writeNotModified(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusNotModified)
 }
 
-// checkPreconditions evaluates request preconditions and reports whether a precondition
+// EvaluatePreconditions evaluates request preconditions and reports whether a precondition
 // resulted in sending StatusNotModified or StatusPreconditionFailed.
-func checkPreconditions(w http.ResponseWriter, r *http.Request, modtime time.Time) (done bool, rangeHeader string) {
+func EvaluatePreconditions(w http.ResponseWriter, r *http.Request, modtime time.Time, etag string) (done bool) {
 	// This function carefully follows RFC 7232 section 6.
-	ch := checkIfMatch(w, r)
-	if ch == condNone {
-		ch = checkIfUnmodifiedSince(r, modtime)
+	if !isZeroTime(modtime) {
+		w.Header().Set("Last-Modified", modtime.UTC().Format(http.TimeFormat))
 	}
-	if ch == condFalse {
+	if etag != "" {
+		w.Header().Set("Etag", etag)
+	}
+	ch := CheckIfMatch(r.Header, etag)
+	if ch == CondNone {
+		ch = CheckIfUnmodifiedSince(r.Header, modtime)
+	}
+	if ch == CondFalse {
 		w.WriteHeader(http.StatusPreconditionFailed)
-		return true, ""
+		return true
 	}
-	switch checkIfNoneMatch(w, r) {
-	case condFalse:
+	switch CheckIfNoneMatch(r.Header, etag) {
+	case CondFalse:
 		if r.Method == "GET" || r.Method == "HEAD" {
-			writeNotModified(w)
-			return true, ""
+			WriteNotModified(w)
+			return true
 		} else {
 			w.WriteHeader(http.StatusPreconditionFailed)
-			return true, ""
+			return true
 		}
-	case condNone:
-		if checkIfModifiedSince(r, modtime) == condFalse {
-			writeNotModified(w)
-			return true, ""
+	case CondNone:
+		if CheckIfModifiedSince(r, modtime) == CondFalse {
+			WriteNotModified(w)
+			return true
 		}
 	}
 
-	rangeHeader = r.Header.Get("Range")
-	if rangeHeader != "" && checkIfRange(w, r, modtime) == condFalse {
-		rangeHeader = ""
-	}
-	return false, rangeHeader
+	return false
 }
 
-// httpRange specifies the byte range to be sent to the client.
-type httpRange struct {
-	start, length int64
+// HTTPRange specifies the byte range to be sent to the client.
+type HTTPRange struct {
+	Start, Length int64
 }
 
-func (r httpRange) contentRange(size int64) string {
-	return fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, size)
+func (r HTTPRange) ContentRange(size int64) string {
+	return fmt.Sprintf("bytes %d-%d/%d", r.Start, r.Start+r.Length-1, size)
 }
 
-func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHeader {
+func (r HTTPRange) MIMEHeader(contentType string, size int64) textproto.MIMEHeader {
 	return textproto.MIMEHeader{
-		"Content-Range": {r.contentRange(size)},
+		"Content-Range": {r.ContentRange(size)},
 		"Content-Type":  {contentType},
 	}
 }
 
-// parseRange parses a Range header string as per RFC 7233.
-// errNoOverlap is returned if none of the ranges overlap.
-func parseRange(s string, size int64) ([]httpRange, error) {
+// ParseRange parses a Range header string as per RFC 7233.
+// ErrNoOverlap is returned if none of the ranges overlap.
+func ParseRange(s string, size int64) ([]HTTPRange, error) {
 	if s == "" {
 		return nil, nil // header not present
 	}
@@ -446,7 +473,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	if !strings.HasPrefix(s, b) {
 		return nil, errors.New("invalid range")
 	}
-	var ranges []httpRange
+	var ranges []HTTPRange
 	noOverlap := false
 	for _, ra := range strings.Split(s[len(b):], ",") {
 		ra = strings.TrimSpace(ra)
@@ -458,7 +485,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			return nil, errors.New("invalid range")
 		}
 		start, end := strings.TrimSpace(ra[:i]), strings.TrimSpace(ra[i+1:])
-		var r httpRange
+		var r HTTPRange
 		if start == "" {
 			// If no start is specified, end specifies the
 			// range start relative to the end of the file.
@@ -469,8 +496,8 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 			if i > size {
 				i = size
 			}
-			r.start = size - i
-			r.length = size - r.start
+			r.Start = size - i
+			r.Length = size - r.Start
 		} else {
 			i, err := strconv.ParseInt(start, 10, 64)
 			if err != nil || i < 0 {
@@ -482,26 +509,26 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 				noOverlap = true
 				continue
 			}
-			r.start = i
+			r.Start = i
 			if end == "" {
 				// If no end is specified, range extends to end of the file.
-				r.length = size - r.start
+				r.Length = size - r.Start
 			} else {
 				i, err := strconv.ParseInt(end, 10, 64)
-				if err != nil || r.start > i {
+				if err != nil || r.Start > i {
 					return nil, errors.New("invalid range")
 				}
 				if i >= size {
 					i = size - 1
 				}
-				r.length = i - r.start + 1
+				r.Length = i - r.Start + 1
 			}
 		}
 		ranges = append(ranges, r)
 	}
 	if noOverlap && len(ranges) == 0 {
 		// The specified ranges did not overlap with the content.
-		return nil, errNoOverlap
+		return nil, ErrNoOverlap
 	}
 	return ranges, nil
 }
@@ -514,23 +541,23 @@ func (w *countingWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// rangesMIMESize returns the number of bytes it takes to encode the
+// RangesMIMESize returns the number of bytes it takes to encode the
 // provided ranges as a multipart response.
-func rangesMIMESize(ranges []httpRange, contentType string, contentSize int64) (encSize int64) {
+func RangesMIMESize(ranges []HTTPRange, contentType string, contentSize int64) (encSize int64) {
 	var w countingWriter
 	mw := multipart.NewWriter(&w)
 	for _, ra := range ranges {
-		mw.CreatePart(ra.mimeHeader(contentType, contentSize))
-		encSize += ra.length
+		mw.CreatePart(ra.MIMEHeader(contentType, contentSize))
+		encSize += ra.Length
 	}
 	mw.Close()
 	encSize += int64(w)
 	return
 }
 
-func sumRangesSize(ranges []httpRange) (size int64) {
+func SumRangesSize(ranges []HTTPRange) (size int64) {
 	for _, ra := range ranges {
-		size += ra.length
+		size += ra.Length
 	}
 	return
 }
