@@ -9,12 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -61,7 +58,6 @@ func min(x, y int64) int64 {
 //
 // Note that *os.File implements the io.ReadSeeker interface.
 func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content) {
-	name := content.Name
 	sizeFunc := content.Size
 
 	// EvaluatePreconditions sets w.Header() Last-Modified and Etag fields for us.
@@ -81,40 +77,17 @@ func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, c
 		rangeReq = ""
 	}
 
-	code := http.StatusOK
-
-	// If Content-Type isn't set, use the file's extension to find it, but
-	// if the Content-Type is unset explicitly, do not sniff the type.
-	ctypes, haveType := w.Header()["Content-Type"]
-	var ctype string
-	if !haveType {
-		ctype = mime.TypeByExtension(filepath.Ext(name))
-		if ctype == "" {
-			// read a chunk to decide between utf-8 text and binary
-			// TODO: don't force reading this twice
-			r, err := content.Range(ctx, 0, min(sniffLen, size))
-			if err != nil {
-				http.Error(w, "failed getting range", http.StatusInternalServerError)
-				return
-			}
-			buf, err := ioutil.ReadAll(r)
-			r.Close()
-			if err != nil {
-				http.Error(w, "failed getting range", http.StatusInternalServerError)
-				return
-			}
-			ctype = http.DetectContentType(buf)
-		}
+	ctype, err := content.ContentType(ctx)
+	if err != nil {
+		http.Error(w, "failed getting content type", http.StatusInternalServerError)
+		return
+	}
+	if ctype != "" {
 		w.Header().Set("Content-Type", ctype)
-	} else if len(ctypes) > 0 {
-		ctype = ctypes[0]
 	}
 
-	sendSize := size
-	sendContent := func() (io.ReadCloser, error) { return content.Range(ctx, 0, size) }
-
 	if size < 0 {
-		w.WriteHeader(code)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -126,86 +99,108 @@ func ServeContent(ctx context.Context, w http.ResponseWriter, r *http.Request, c
 		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
+
+	switch {
+	case len(ranges) == 1:
+		oneRange(ctx, w, r, content, ranges[0], size)
+		return
+	case len(ranges) > 1:
+		multiRange(ctx, w, r, content, ranges, size, ctype)
+		return
+	}
+	noRanges(ctx, w, r, content, size)
+}
+
+func noRanges(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content, size int64) {
+	if r.Method == "HEAD" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	rc, err := content.Range(ctx, 0, size)
+	if err != nil {
+		// TODO: this maybe should be http.StatusRequestedRangeNotSatisfiable sometimes
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+
+	w.WriteHeader(http.StatusOK)
+	io.CopyN(w, rc, size)
+}
+
+func oneRange(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content, ra HTTPRange, size int64) {
+	// RFC 7233, Section 4.1:
+	// "If a single part is being transferred, the server
+	// generating the 206 response MUST generate a
+	// Content-Range header field, describing what range
+	// of the selected representation is enclosed, and a
+	// payload consisting of the range.
+	// ...
+	// A server MUST NOT generate a multipart response to
+	// a request for a single range, since a client that
+	// does not request multiple parts might not support
+	// multipart responses."
+	w.Header().Set("Content-Range", ra.ContentRange(size))
+
+	if r.Method == "HEAD" {
+		w.WriteHeader(http.StatusPartialContent)
+		return
+	}
+
+	rc, err := content.Range(ctx, ra.Start, ra.Length)
+	if err != nil {
+		// TODO: should we return http.StatusRequestedRangeNotSatisfiable in certain
+		// Range error conditions?
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+
+	w.WriteHeader(http.StatusPartialContent)
+	io.CopyN(w, rc, ra.Length)
+}
+
+func multiRange(ctx context.Context, w http.ResponseWriter, r *http.Request, content Content, ranges []HTTPRange, size int64, ctype string) {
 	if SumRangesSize(ranges) > size {
 		// The total number of bytes in all the ranges
 		// is larger than the size of the file by
 		// itself, so this is probably an attack, or a
 		// dumb client. Ignore the range request.
-		ranges = nil
-	}
-	switch {
-	case len(ranges) == 1:
-		// RFC 7233, Section 4.1:
-		// "If a single part is being transferred, the server
-		// generating the 206 response MUST generate a
-		// Content-Range header field, describing what range
-		// of the selected representation is enclosed, and a
-		// payload consisting of the range.
-		// ...
-		// A server MUST NOT generate a multipart response to
-		// a request for a single range, since a client that
-		// does not request multiple parts might not support
-		// multipart responses."
-		ra := ranges[0]
-		sendContent = func() (io.ReadCloser, error) {
-			// TODO: should we return http.StatusRequestedRangeNotSatisfiable in certain
-			// Range error conditions?
-			return content.Range(ctx, ra.Start, ra.Length)
-		}
-		sendSize = ra.Length
-		code = http.StatusPartialContent
-		w.Header().Set("Content-Range", ra.ContentRange(size))
-	case len(ranges) > 1:
-		sendSize = RangesMIMESize(ranges, ctype, size)
-		code = http.StatusPartialContent
-
-		pr, pw := io.Pipe()
-		mw := multipart.NewWriter(pw)
-		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
-		sendContent = func() (io.ReadCloser, error) { return ioutil.NopCloser(pr), nil }
-		defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
-		go func() {
-			for _, ra := range ranges {
-				part, err := mw.CreatePart(ra.MIMEHeader(ctype, size))
-				if err != nil {
-					pw.CloseWithError(err)
-					return
-				}
-				contentRange, err := content.Range(ctx, ra.Start, ra.Length)
-				if err != nil {
-					pw.CloseWithError(err)
-					return
-				}
-				_, err = io.CopyN(part, contentRange, ra.Length)
-				contentRange.Close()
-				if err != nil {
-					pw.CloseWithError(err)
-					return
-				}
-			}
-			mw.Close()
-			pw.Close()
-		}()
-
-		w.Header().Set("Accept-Ranges", "bytes")
-		if w.Header().Get("Content-Encoding") == "" {
-			w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
-		}
+		noRanges(ctx, w, r, content, size)
+		return
 	}
 
-	w.WriteHeader(code)
+	sendSize := RangesMIMESize(ranges, ctype, size)
 
-	if r.Method != "HEAD" {
-		r, err := sendContent()
+	mw := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+	w.Header().Set("Accept-Ranges", "bytes")
+	if w.Header().Get("Content-Encoding") == "" {
+		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+
+	if r.Method == "HEAD" {
+		return
+	}
+
+	for _, ra := range ranges {
+		part, err := mw.CreatePart(ra.MIMEHeader(ctype, size))
 		if err != nil {
-			// TODO: this maybe should be http.StatusRequestedRangeNotSatisfiable sometimes
-			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer r.Close()
-
-		io.CopyN(w, r, sendSize)
+		contentRange, err := content.Range(ctx, ra.Start, ra.Length)
+		if err != nil {
+			return
+		}
+		_, err = io.CopyN(part, contentRange, ra.Length)
+		contentRange.Close()
+		if err != nil {
+			return
+		}
 	}
+	mw.Close()
 }
 
 // ScanETag determines if a syntactically valid ETag is present at s. If so,
